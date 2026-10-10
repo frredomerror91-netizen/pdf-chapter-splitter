@@ -13,3 +13,4 @@
 - 重做 Tkinter 界面，增加三步工作区布局、统计卡片、识别模式选择、长路径显示、打开文件/文件夹、导出完成后自动打开和更明确的状态提示。
 - 统一 PDF 分析接口和异常提示，保持书签优先、页面标题回退、手动边界校对和原文件不覆盖行为。
 - 完善 README 的安装、使用流程、识别规则、扫描版 PDF 处理、目录结构和开发验证说明。
+- 完成 GitHub private 仓库创建与首个 main 分支推送：https://github.com/frredomerror91-netizen/pdf-chapter-splitter。
