@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+.vscode/
+.idea/
+*.pdf
+*.PDF
+tests/_fixtures/
+tests/_tmp/
+verification_sample_*/
+docs/superpowers/
