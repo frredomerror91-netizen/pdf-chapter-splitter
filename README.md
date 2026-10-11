@@ -1,132 +1,127 @@
 # PDF 章节拆分器
 
-一个面向 Windows 的本地 PDF 整理工具。选择一份长 PDF 后，它会读取内置书签或扫描页面标题，生成可校对的章节边界，并批量导出每章一个 PDF。
+当前版本：**v1.4.0**。面向 Windows 的本地 PDF 整理工具，支持识别章节、校对起始页和批量导出每章一个 PDF。扫描版可以在工具内一键调用 Umi-OCR，识别完成后保留整本可搜索 PDF。
 
-工具围绕三个动作设计：**选择资料 → 校对章节 → 导出文件**。原始 PDF 始终保持不变，所有结果写入旁边的独立文件夹。
+**选择 PDF → 分析或一键 OCR → 校对章节 → 导出。** 原始 PDF 保持不变。
 
-## 功能
+完整操作步骤见 [使用说明](docs/使用说明.md)，版本变化见 [更新日志](CHANGELOG.md)。
 
-- 自动读取 PDF 内置目录/书签，识别形如“第 1 章”或“Chapter 1”的章节条目。
-- 没有可用书签时，扫描页面文字层前部的章节标题。
-- 提供三种检测模式：
-  - **自动（书签优先）**：先读书签，找不到时再读页面标题；
-  - **仅 PDF 书签**：只使用文档目录，适合目录结构可靠的教材；
-  - **仅页面标题**：忽略书签，直接扫描页面文字。
-- 双击编辑章节标题或起始页，结束页自动根据下一章重新计算。
-- 手动添加、删除章节，适合目录缺失或扫描版资料。
-- 自动保留第一个章节前的封面、目录和前言，命名为“前置内容”。
-- Windows 文件名安全化、重复标题自动编号、输出进度提示。
-- 导出完成后可自动打开输出文件夹。
-- 全部处理在本机完成，不上传 PDF 内容。
+## v1.4.0 的主要功能
 
-## 快速开始
+- 一键 OCR 并分析，无需手动切换到 OCR 软件或重新选择识别结果。
+- 100 页及以上自动均匀分块，每块最多 50 页，最多两个隔离的 Umi-OCR 引擎并行处理，完成后按原页序合并整本 PDF。
+- 大型任务保留已完成分块；失败或取消后，重新执行可复用符合校验的检查点。
+- 成功 OCR 后在原文件旁保存 `<原文件名>_OCR.pdf`，即使后续章节分析失败也能继续使用。
+- 优先识别 PDF 书签，再尝试页面章节标题；过滤纯页码书签、目录条目和重复章页眉。
+- 支持双击编辑章节标题和起始页、手动添加或删除章节，保留封面和目录等前置内容。
+- 支持明亮和暗夜主题，保存主题偏好与 OCR 设置。
 
-### 直接启动
+大型 PDF 的中间分块用于 OCR；最终导出按校对后的章节范围生成文件。
 
-在 Windows 中双击：
+## 下载与安装
 
-```text
-启动章节拆分工具.cmd
-```
+发行包是源码版，需要 **Windows、Python 3.10 或更高版本，以及 Tkinter**。Windows 官方 Python 安装程序通常包含 Tkinter，安装时勾选“Add python.exe to PATH”。
 
-启动入口会优先寻找本机已配置的 Python；找不到时再使用系统 `python` 命令。
-
-### 安装依赖
-
-首次使用或系统 Python 尚未安装依赖时，在项目目录打开 PowerShell：
+1. 在本仓库 Releases 下载对应版本的源码 ZIP，或使用“Code → Download ZIP”。
+2. 完整解压到可写目录，例如 `D:\Tools\pdf-chapter-splitter`。
+3. 在解压后的项目目录打开 PowerShell，安装运行依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-也可以执行 PowerShell 入口：
+4. 双击 `启动章节拆分工具.cmd`。也可直接启动：
+
+```powershell
+python .\split_pdf_by_chapter.py
+```
+
+PowerShell 启动入口：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\启动章节拆分工具.ps1
 ```
 
-运行环境建议使用 Python 3.10 或更高版本。
+启动脚本优先使用当前用户已安装的 Codex Python 运行时，找不到时使用系统 `python`。安装依赖与启动程序应使用同一个 Python 环境。
 
-## 使用流程
+## 配置一键 OCR
 
-1. 点击左侧“选择 PDF”。工具会默认把输出目录设置为：
+有可靠书签或可提取文字的 PDF 可以直接分析。扫描版需要另外安装 [Umi-OCR 便携版](https://github.com/hiroi-sora/Umi-OCR/releases)。本版本实际验证使用 **Umi-OCR Rapid v2.1.5**；文档接口说明见 [Umi-OCR PDF HTTP 接口](https://github.com/hiroi-sora/Umi-OCR/blob/main/docs/http/api_doc.md)。
 
-   ```text
-   原文件名_章节拆分
-   ```
+1. 下载 Umi-OCR 并完整解压，保留主程序旁的 `UmiOCR-data` 目录。
+2. 打开本工具的“OCR 设置”，选择解压目录中的 `Umi-OCR.exe`。
+3. 保持 HTTP 服务为“仅本地”，地址与本工具配置一致；默认是 `http://127.0.0.1:1224`。
+4. 保存设置后，选中 PDF，点击“一键 OCR 并分析”。后续无需重复配置。
 
-2. 选择识别方式。一般资料使用“自动（书签优先）”。
-3. 点击“分析章节”。右侧表格会显示序号、标题、起始页、结束页和识别来源。
-4. 检查章节边界：
-   - 双击标题可以修改文件名中的章节标题；
-   - 双击起始页可以移动章节边界；
-   - 点击“添加章节”可以输入标题和起始页；
-   - 选中一行后点击“删除所选”可以移除误识别的章节。
-5. 选择输出文件夹，点击“导出章节 PDF”。
-6. 导出的文件形如：
-
-   ```text
-   01_第1章 基础.pdf
-   02_第2章 进阶.pdf
-   ```
-
-## 识别规则与限制
-
-### 有文字层的 PDF
-
-工具会识别页面前部、以这些形式开头的标题：
+也可以把完整便携版放到以下位置，工具会尝试自动找到主程序：
 
 ```text
-第 1 章 文件基础
-第2章：进阶内容
-Chapter 3: Parsing
+tools/Umi-OCR/Umi-OCR.exe
+tools/Umi-OCR_Rapid_v2.1.5/Umi-OCR.exe
+Umi-OCR/Umi-OCR.exe
 ```
 
-正文中间出现的“第 X 章”不会作为章节标题，除非它位于一行开头。
+程序会连接已有的本地服务，或隐藏启动配置的 Umi-OCR。大型 PDF 另行准备两个临时隔离实例，任务结束后回收。OCR 只与本机 HTTP 服务交换文件。
 
-### 扫描版 PDF
+Umi-OCR、模型、个人设置和教材 PDF 不包含在源码发行包中。
 
-如果 PDF 只有图片、没有文字层，页面标题扫描不会找到章节。这时可以：
+## 日常使用
 
-1. 先用 PDFgear 等工具进行 OCR 并另存为带文字层的 PDF；或
-2. 在本工具中分析后，使用“添加章节”手动输入每章起始页。
+1. 点击“选择 PDF”，确认文件和输出目录。
+2. 通常使用“自动（书签优先）”，点击“分析章节”。纯扫描版在勾选“无文字层时自动 OCR”后会自动进入 OCR。
+3. 对部分扫描页或文字层不可靠的资料，点击“一键 OCR 并分析”。
+4. 在章节表格中校对标题和起始页。页码按 PDF 文件从 1 开始计算；双击可编辑，结束页根据下一章起始页计算。
+5. 检查章节覆盖全部页面，再点击“开始导出”。
+6. 在左侧“输出设置”中勾选“暗夜模式”可以切换主题。
 
-### 加密 PDF
-
-加密 PDF 需要先解密或另存为未加密 PDF。工具不会尝试破解密码，也不会覆盖原文件。
-
-### 书签层级
-
-工具优先选择标题形如“第 X 章”或“Chapter X”的书签。若书签没有这些文字模式，则使用最顶层书签作为候选，导出前应在表格中复核。
-
-## 目录结构
+输出示例：
 
 ```text
-pdf-chapter-splitter/
-├─ pdf_chapter_splitter_core.py     # 识别、页码计算和 PDF 导出
-├─ split_pdf_by_chapter.py          # Tkinter 桌面界面
-├─ tests/                           # unittest 核心测试
-├─ 启动章节拆分工具.cmd              # Windows 双击入口
-├─ 启动章节拆分工具.ps1              # PowerShell 入口
-├─ requirements.txt                 # 运行依赖
-└─ requirements-dev.txt             # 测试依赖
+教材.pdf
+教材_OCR.pdf
+教材_章节拆分/
+├─ 01_前置内容.pdf
+├─ 02_第1章 绪论.pdf
+└─ 03_第2章 基础知识.pdf
 ```
+
+已有默认输出目录时会选择带新编号的目录。成功重新 OCR 同一份原文件时，会更新同名 OCR PDF；失败或取消的大型分块任务不会用未完成结果覆盖已有完整 OCR PDF。
+
+## 大型 PDF 的处理与恢复
+
+100 页及以上自动分块。例如 657 页会分为 14 块，其中 13 块为 47 页、1 块为 46 页；界面显示累计识别页数、完成块数和合并阶段。
+
+所有分块完成后，程序核对原文件、各块页数和总页数，再按原始顺序合并，保留原始书签和元数据。中途失败或取消时，已完成块保存在项目内的 `.ocr-cache/jobs/`；保留缓存并再次执行同一任务，可以减少重复识别。
+
+持续有新增页面进度时没有固定一小时截止；连续 15 分钟没有新增页面进度会提示停滞。并行效率受 CPU、磁盘、页面尺寸和文字密度影响。
+
+## 常见问题
+
+| 现象 | 处理方法 |
+| --- | --- |
+| 双击后提示找不到 Python | 安装 Python 3.10+ 并加入 PATH，重新打开终端后安装依赖。 |
+| 提示缺少 pypdf | 用实际启动程序的 Python 执行 `-m pip install -r requirements.txt`。 |
+| 找不到 Umi-OCR 或 HTTP 连接失败 | 在“OCR 设置”选择完整便携版主程序，并检查 HTTP 服务、地址和端口。 |
+| 大型 PDF 提示需要完整便携版 | 选择本机 `Umi-OCR.exe`；仅填写 HTTP 地址不足以创建独立引擎。 |
+| OCR 已完成，章节分析失败 | 按提示打开已保存的 `*_OCR.pdf`；可重新分析或手动添加章节。 |
+| 章节标题或起始页不准确 | 对照原 PDF 手动校正。OCR 和标题规则可能误识别，导出前需检查。 |
+| PDF 已加密 | 先用知道密码的 PDF 软件解密或另存为未加密文件。 |
+| 大型任务失败或取消 | 保留缓存，对同一份未改动资料重新执行 OCR。 |
+
+更多说明见 [完整使用说明](docs/使用说明.md)。
 
 ## 开发与验证
 
-安装开发依赖：
-
 ```powershell
 python -m pip install -r requirements-dev.txt
-```
-
-运行测试：
-
-```powershell
 python -m unittest discover -s tests -p "test_*.py"
-python -m py_compile pdf_chapter_splitter_core.py split_pdf_by_chapter.py
+python -m py_compile pdf_chapter_splitter_core.py pdf_ocr_workflow.py ocr_chunks.py umi_ocr_pool.py umi_ocr_client.py umi_ocr_service.py split_pdf_by_chapter.py
 ```
+
+回归覆盖章节识别、原文件保护、OCR 文件保存、失败与取消、并行分块、缓存恢复和界面交互。HTTP 测试使用本地模拟服务；真实 OCR 需要另外安装 Umi-OCR。无图形显示环境时，界面测试会跳过。
+
+核心入口：`split_pdf_by_chapter.py`；OCR 工作流：`pdf_ocr_workflow.py`；分块与引擎隔离：`ocr_chunks.py`、`umi_ocr_pool.py`。
 
 ## 许可证
 
-本项目使用 [MIT License](LICENSE)。
+本项目使用 [MIT License](LICENSE)。Umi-OCR 是独立的第三方软件，使用和分发遵循其上游许可证；本仓库没有将 Umi-OCR 二进制或模型打包进源码发行包。

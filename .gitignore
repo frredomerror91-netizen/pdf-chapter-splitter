@@ -15,3 +15,15 @@ tests/_fixtures/
 tests/_tmp/
 verification_sample_*/
 docs/superpowers/
+.ocr-cache/
+umi-ocr.local.json
+.umi-ocr.local.json.tmp
+tools/Umi-OCR*/
+Umi-OCR*/
+vendor/Umi-OCR/
+outputs/
+dist/
+task_plan.md
+findings.md
+progress.md
+.planning/

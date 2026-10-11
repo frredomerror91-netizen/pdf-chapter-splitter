@@ -1,6 +1,6 @@
 @echo off
 set "SCRIPT=%~dp0split_pdf_by_chapter.py"
-set "BUNDLED_PYTHON=C:\Users\21058\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "BUNDLED_PYTHON=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 
 if exist "%BUNDLED_PYTHON%" goto run_bundled
 where python >nul 2>&1

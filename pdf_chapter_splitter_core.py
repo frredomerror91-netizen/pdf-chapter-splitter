@@ -37,18 +37,37 @@ class DetectionResult:
     markers: list[ChapterMarker]
     method: str
     warning: str | None = None
+    has_text_layer: bool | None = None
 
 
 _CHINESE_CHAPTER_RE = re.compile(
-    r"^第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*章(?:\s*[-—:：.、]?\s*.*)?$",
+    r"^第\s*(?P<number>[0-9一二三四五六七八九十百千万零〇两]+)\s*章(?:\s*[-—:：.、]?\s*.*)?$",
     re.IGNORECASE,
 )
 _ENGLISH_CHAPTER_RE = re.compile(
-    r"^chapter\s+(?:[0-9]+|[ivxlcdm]+)(?:\s*[-—:：.、]?\s*.*)?$",
+    r"^chapter\s+(?P<number>[0-9]+|[ivxlcdm]+)(?:\s*[-—:：.、]?\s*.*)?$",
     re.IGNORECASE,
 )
 _INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _RESERVED_FILENAME_RE = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE)
+_PAGE_BOOKMARK_RE = re.compile(
+    r"^(?:[0-9ivxlcdm]+|(?:page|p\.?|页码?|第)\s*[0-9ivxlcdm]+\s*[页頁]?)$",
+    re.IGNORECASE,
+)
+_FRONT_MATTER_TITLES = {
+    "封面", "封底", "书名", "版权", "版权页", "前言", "序言", "目录", "目次",
+    "cover", "title page", "copyright", "preface", "foreword", "contents", "table of contents", "toc",
+}
+_CONTENTS_LEADER_RE = re.compile(r"(?:[.．·…]{2,}|-{3,})\s*[0-9]+\s*$")
+_CONTENTS_TITLE_RE = re.compile(
+    r"^(?:[0-9ivxlcdmⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ\s·•]*目\s*[录錄次][0-9ivxlcdmoⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ\s·•]*"
+    r"|(?:table\s+of\s+)?contents(?:\s+[0-9ivxlcdm]+)?)$",
+    re.IGNORECASE,
+)
+_BARE_CHAPTER_RE = re.compile(
+    r"^(?:第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*章|chapter\s+(?:[0-9]+|[ivxlcdm]+))$",
+    re.IGNORECASE,
+)
 
 
 def _normalise_text(value: str) -> str:
@@ -60,11 +79,40 @@ def detect_heading_title(text: str) -> str | None:
 
     for raw_line in text.splitlines() or [text]:
         line = _normalise_text(raw_line)
-        if not line or len(line) > 180:
+        line = re.sub(r"^[*＊]+\s*", "", line)
+        if not line or len(line) > 180 or _CONTENTS_LEADER_RE.search(line):
             continue
         if _CHINESE_CHAPTER_RE.match(line) or _ENGLISH_CHAPTER_RE.match(line):
             return line
     return None
+
+
+def _chapter_number(title: str) -> int:
+    match = _CHINESE_CHAPTER_RE.match(title) or _ENGLISH_CHAPTER_RE.match(title)
+    token = match.group("number")
+    if token.isdecimal():
+        return int(token)
+    if token.isascii():
+        roman_values = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+        total = highest = 0
+        for character in reversed(token.lower()):
+            value = roman_values[character]
+            total += -value if value < highest else value
+            highest = max(highest, value)
+        return total
+    digits = dict(zip("零〇一二两三四五六七八九", (0, 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9)))
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    total = section = number = 0
+    for character in token:
+        if character in digits:
+            number = number * 10 + digits[character]
+        elif character == "万":
+            total += (section + number or 1) * units[character]
+            section = number = 0
+        else:
+            section += (number or 1) * units[character]
+            number = 0
+    return total + section + number
 
 
 def _marker_preference(marker: ChapterMarker) -> tuple[int, int]:
@@ -194,7 +242,13 @@ def extract_bookmark_markers(pdf_path: Path) -> list[ChapterMarker]:
         return []
     top_level = min(marker.level for marker in collected)
     return _deduplicate_markers(
-        [marker for marker in collected if marker.level == top_level], len(reader.pages)
+        [
+            marker for marker in collected
+            if marker.level == top_level
+            and not _PAGE_BOOKMARK_RE.fullmatch(marker.title)
+            and marker.title.casefold() not in _FRONT_MATTER_TITLES
+        ],
+        len(reader.pages),
     )
 
 
@@ -202,7 +256,14 @@ def extract_text_markers(pdf_path: Path) -> list[ChapterMarker]:
     """Find the first chapter-like line on each page with a text layer."""
 
     reader = PdfReader(str(pdf_path))
+    markers, _text_layer = _scan_text_markers(reader)
+    return markers
+
+
+def _scan_text_markers(reader: PdfReader) -> tuple[list[ChapterMarker], bool]:
     markers: list[ChapterMarker] = []
+    text_layer = False
+    seen_chapters: set[int] = set()
     for page_number, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
@@ -210,12 +271,43 @@ def extract_text_markers(pdf_path: Path) -> list[ChapterMarker]:
             text = ""
         if not text.strip():
             continue
-        for raw_line in text.splitlines()[:40]:
-            title = detect_heading_title(raw_line)
-            if title:
-                markers.append(ChapterMarker(title, page_number, "text"))
-                break
-    return _deduplicate_markers(markers, len(reader.pages))
+        text_layer = True
+        all_lines = [_normalise_text(line) for line in text.splitlines()]
+        if any(_CONTENTS_TITLE_RE.fullmatch(line) for line in all_lines):
+            continue
+        chapter_lines = [(index, title) for index, line in enumerate(all_lines) if (title := detect_heading_title(line))]
+        numbers = {_chapter_number(title) for _index, title in chapter_lines}
+        # A contents page lists several chapters; running headers repeat the same chapter.
+        if len(numbers) != 1:
+            continue
+        lines = all_lines[:40]
+        candidates = [(index, title) for index, title in chapter_lines if index < 40]
+        if not candidates:
+            continue
+        number = next(iter(numbers))
+        if number in seen_chapters:
+            continue
+        seen_chapters.add(number)
+        position, title = candidates[0]
+        if _BARE_CHAPTER_RE.fullmatch(title):
+            following = next((line for line in lines[position + 1:] if line), "")
+            if (
+                1 <= len(following) <= 30
+                and not re.search(r"[。！？；.!?;]|^[0-9]", following)
+                and not detect_heading_title(following)
+            ):
+                title = f"{title} {following}"
+        markers.append(ChapterMarker(title, page_number, "text"))
+    return _deduplicate_markers(markers, len(reader.pages)), text_layer
+
+
+def should_auto_ocr(result: DetectionResult, mode: str = "auto") -> bool:
+    """Return whether automatic OCR is appropriate for this analysis result."""
+
+    return (
+        result.total_pages > 0 and mode in {"auto", "text"}
+        and result.method == "none" and result.has_text_layer is False
+    )
 
 
 
@@ -236,12 +328,17 @@ def analyze_pdf(pdf_path: Path, mode: str = "auto") -> DetectionResult:
         if bookmark_markers:
             return DetectionResult(total_pages, bookmark_markers, "bookmark")
         if mode == "bookmark":
-            return DetectionResult(total_pages, [], "none", "没有找到可用的 PDF 书签章节。")
+            return DetectionResult(total_pages, [], "none", "没有找到可用的章节书签，纯页码和封面等书签已忽略。")
 
-    text_markers = extract_text_markers(pdf_path)
+    text_markers, text_layer = _scan_text_markers(reader)
     if text_markers:
-        return DetectionResult(total_pages, text_markers, "text")
-    return DetectionResult(total_pages, [], "none", "没有找到可识别的页面章节标题。")
+        return DetectionResult(total_pages, text_markers, "text", has_text_layer=text_layer)
+    warning = (
+        "没有找到可识别的页面章节标题。"
+        if text_layer
+        else "PDF 没有文字层，可以自动调用 Umi-OCR 后重新分析。"
+    )
+    return DetectionResult(total_pages, [], "none", warning, text_layer)
 
 def safe_filename(value: str) -> str:
     """Make a title safe for a Windows filename while retaining readable text."""

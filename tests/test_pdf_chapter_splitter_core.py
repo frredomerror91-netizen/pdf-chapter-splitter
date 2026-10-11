@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -20,6 +22,7 @@ from pdf_chapter_splitter_core import (
     extract_text_markers,
     recompute_ranges,
     safe_filename,
+    should_auto_ocr,
     split_pdf,
 )
 
@@ -30,6 +33,14 @@ class HeadingDetectionTests(unittest.TestCase):
         self.assertEqual(detect_heading_title("CHAPTER 2: Parsing"), "CHAPTER 2: Parsing")
         self.assertEqual(detect_heading_title("普通正文 第 3 章并不在页首"), None)
         self.assertIsNone(detect_heading_title("本章介绍 PDF 的基本概念"))
+
+    def test_table_of_contents_lines_are_not_chapter_start_titles(self) -> None:
+        self.assertIsNone(detect_heading_title("CHAPTER 1: Basics ........ 12"))
+        self.assertIsNone(detect_heading_title("第十一章 静电场………1"))
+
+    def test_starred_optional_chapter_titles_are_supported(self) -> None:
+        self.assertEqual(detect_heading_title("*第15章 原子核物理和粒子物理简介"), "第15章 原子核物理和粒子物理简介")
+        self.assertEqual(detect_heading_title("＊ CHAPTER III: Optional"), "CHAPTER III: Optional")
 
 
 class RangeConstructionTests(unittest.TestCase):
@@ -102,6 +113,16 @@ class PdfDetectionAndSplitTests(unittest.TestCase):
             pdf.showPage()
         pdf.save()
 
+    def _write_heading_pages(self, path: Path, pages: list[list[str]]) -> None:
+        pdf = canvas.Canvas(str(path), pagesize=letter)
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        for lines in pages:
+            pdf.setFont("STSong-Light", 12)
+            for index, line in enumerate(lines):
+                pdf.drawString(72, 720 - 10 * index, line)
+            pdf.showPage()
+        pdf.save()
+
     def test_extract_bookmark_markers_uses_one_based_pages(self) -> None:
         source = self.root / f"{self._testMethodName}.pdf"
         writer = PdfWriter()
@@ -126,6 +147,88 @@ class PdfDetectionAndSplitTests(unittest.TestCase):
         markers = extract_text_markers(source)
 
         self.assertEqual([(item.title, item.page) for item in markers], [("CHAPTER 1: Basics", 1), ("CHAPTER 2: Parsing", 3)])
+
+    def test_contents_and_repeated_chapter_headers_do_not_split_every_page(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["CONTENTS", "CHAPTER 1: Basics", "CHAPTER 2: Parsing"],
+            ["Preface"],
+            ["CHAPTER 1: Basics", "First chapter begins here"],
+            ["CHAPTER 1: Basics", "More body text"],
+            ["CHAPTER 2: Parsing", "Second chapter begins here"],
+            ["CHAPTER 2: Parsing", "More body text"],
+        ])
+        result = analyze_pdf(source, mode="text")
+        self.assertEqual([(item.title, item.page) for item in result.markers], [("CHAPTER 1: Basics", 3), ("CHAPTER 2: Parsing", 5)])
+        ranges = build_ranges(result.markers, result.total_pages)
+        self.assertEqual([(item.start_page, item.end_page) for item in ranges], [(1, 2), (3, 4), (5, 6)])
+
+    def test_unlabelled_contents_page_with_multiple_chapters_is_skipped(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["CHAPTER 1: Basics", "CHAPTER 2: Parsing", "CHAPTER 3: Exports"],
+            ["CHAPTER 1: Basics", "Body"],
+            ["CHAPTER 2: Parsing", "Body"],
+            ["CHAPTER 3: Exports", "Body"],
+        ])
+        self.assertEqual([item.page for item in extract_text_markers(source)], [2, 3, 4])
+
+    def test_ocr_contents_headers_with_roman_page_numbers_and_extra_glyphs_are_skipped(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["目录O", "第9章 气体动理论"],
+            ["Ⅱ目录", "第10章 热力学基础"],
+            ["第9章 气体动理论"],
+            ["第10章 热力学基础"],
+        ])
+        self.assertEqual([item.page for item in extract_text_markers(source)], [3, 4])
+
+    def test_contents_marker_at_page_footer_is_detected_even_after_forty_lines(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["第15章 原子物理"] + ["15.1 Section index"] * 45 + ["目录V"],
+            ["第15章 原子物理"],
+        ])
+        self.assertEqual([item.page for item in extract_text_markers(source)], [2])
+
+    def test_unlabelled_contents_with_later_chapters_beyond_forty_lines_is_skipped(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["CHAPTER 4: Algebra"] + ["4.1 Section index"] * 45 + ["CHAPTER 5: Maps"],
+            ["CHAPTER 4: Algebra"], ["CHAPTER 5: Maps"],
+        ])
+        self.assertEqual([item.page for item in extract_text_markers(source)], [2, 3])
+
+    def test_chapter_number_and_name_on_adjacent_lines_are_joined(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["第9章", "气体动理论", "这是正文的开始。"],
+            ["第10章", "热力学基础", "这是下一章正文的开始。"],
+        ])
+        self.assertEqual(
+            [(item.title, item.page) for item in extract_text_markers(source)],
+            [("第9章 气体动理论", 1), ("第10章 热力学基础", 2)],
+        )
+
+    def test_starred_chapter_start_is_used_before_later_running_header(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["第14章 量子物理"],
+            ["*第15章", "原子核物理和粒子物理简介", "这是选学章节的正文。"],
+            ["第15章原子核物理和粒子物理简介·267"],
+        ])
+        self.assertEqual(
+            [(item.title, item.page) for item in extract_text_markers(source)],
+            [("第14章 量子物理", 1), ("第15章 原子核物理和粒子物理简介", 2)],
+        )
+
+    def test_roman_and_arabic_running_headers_for_same_chapter_are_collapsed(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        self._write_heading_pages(source, [
+            ["CHAPTER I: Basics"], ["CHAPTER 1: Basics"],
+            ["CHAPTER II: Parsing"], ["CHAPTER 2: Parsing"],
+        ])
+        self.assertEqual([item.page for item in extract_text_markers(source)], [1, 3])
 
     def test_analyze_pdf_auto_prefers_bookmarks(self) -> None:
         source = self.root / f"{self._testMethodName}.pdf"
@@ -159,6 +262,56 @@ class PdfDetectionAndSplitTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             analyze_pdf(source, mode="unknown")
+
+    def test_page_number_bookmarks_and_front_matter_do_not_become_chapters(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        writer = PdfWriter()
+        for _ in range(12):
+            writer.add_blank_page(width=300, height=400)
+        writer.add_outline_item("封面", 0)
+        writer.add_outline_item("目录", 1)
+        for page in range(2, 12):
+            writer.add_outline_item(str(page - 1), page)
+        writer.write(source)
+
+        markers = extract_bookmark_markers(source)
+        result = analyze_pdf(source)
+
+        self.assertEqual(markers, [])
+        self.assertEqual(result.method, "none")
+        self.assertTrue(should_auto_ocr(result))
+
+    def test_numbered_page_bookmarks_are_ignored_but_named_top_level_sections_remain(self) -> None:
+        source = self.root / f"{self._testMethodName}.pdf"
+        writer = PdfWriter()
+        for _ in range(10):
+            writer.add_blank_page(width=300, height=400)
+        for title, page in (("封面", 0), ("Page 2", 1), ("Introduction", 2), ("第 4 页", 3), ("Methods", 5), ("42", 6)):
+            writer.add_outline_item(title, page)
+        writer.write(source)
+
+        self.assertEqual(
+            [(item.title, item.page) for item in extract_bookmark_markers(source)],
+            [("Introduction", 3), ("Methods", 6)],
+        )
+
+    def test_analyze_pdf_distinguishes_missing_text_layer_from_unmatched_headings(self) -> None:
+        blank_source = self.root / f"{self._testMethodName}_blank.pdf"
+        self._write_blank_pdf(blank_source, page_count=2)
+        blank_result = analyze_pdf(blank_source, mode="auto")
+
+        text_source = self.root / f"{self._testMethodName}_text.pdf"
+        pdf = canvas.Canvas(str(text_source), pagesize=letter)
+        pdf.drawString(72, 720, "这是普通正文，没有章节标题。")
+        pdf.showPage()
+        pdf.save()
+        text_result = analyze_pdf(text_source, mode="auto")
+
+        self.assertFalse(blank_result.has_text_layer)
+        self.assertTrue(text_result.has_text_layer)
+        self.assertTrue(should_auto_ocr(blank_result, mode="auto"))
+        self.assertFalse(should_auto_ocr(text_result, mode="auto"))
+
     def test_split_pdf_creates_expected_page_counts_without_touching_source(self) -> None:
         source = self.root / f"{self._testMethodName}.pdf"
         output_dir = self.root / f"{self._testMethodName}_output"

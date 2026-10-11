@@ -1,5 +1,5 @@
 $scriptPath = Join-Path $PSScriptRoot 'split_pdf_by_chapter.py'
-$bundledPython = 'C:\Users\21058\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+$bundledPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
 
 if (Test-Path -LiteralPath $bundledPython) {
     & $bundledPython $scriptPath
