@@ -5,7 +5,7 @@ import json
 import os
 import threading
 import uuid
-from collections import deque
+from queue import Queue, Empty, Full
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import wraps
@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 
 from pypdf import PdfReader, PdfWriter
 
+from pdf_reader_recovery import RecoveryPdfReader
 from umi_ocr_client import OcrCancelledError, OcrProgress, UmiOcrClient, UmiOcrError
 
 
@@ -140,17 +141,19 @@ def ocr_pdf_in_chunks(
     cancel_event: threading.Event | None = None,
     engine_key: str = "default",
 ) -> Path:
-    """Run one queue per independent client and publish only a verified complete PDF."""
+    """Prepare pages on one thread and feed independent OCR engines as inputs become ready."""
     if source_path.resolve() == destination_path.resolve():
         raise UmiOcrError("分块 OCR 输出不能覆盖原始 PDF。")
     if not clients:
         raise UmiOcrError("没有可用的 OCR 引擎。")
-    _check_cancelled(cancel_event)
-    source = PdfReader(source_path)
+    cancel = cancel_event if cancel_event is not None else threading.Event()
+    _check_cancelled(cancel)
+    source = RecoveryPdfReader(source_path)
     if source.is_encrypted:
         raise UmiOcrError("PDF 已加密，请先另存为未加密 PDF。")
-    chunks = plan_ocr_chunks(len(source.pages), max_chunk_pages)
-    signature = {"version": 1, "source_sha256": _sha256(source_path), "pages": len(source.pages),
+    total_pages = len(source.pages)
+    chunks = plan_ocr_chunks(total_pages, max_chunk_pages)
+    signature = {"version": 1, "source_sha256": _sha256(source_path), "pages": total_pages,
                  "max_chunk_pages": max_chunk_pages, "mode": extraction_mode, "engine": engine_key}
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
     job_dir = cache_dir / key
@@ -163,57 +166,79 @@ def ocr_pdf_in_chunks(
     except (OSError, ValueError):
         manifest = {}
     entries = manifest.get("completed", {})
-    if not isinstance(entries, dict):
-        entries = {}
+    inputs = manifest.get("inputs", {})
+    entries = entries if isinstance(entries, dict) else {}
+    inputs = inputs if isinstance(inputs, dict) else {}
     lock = threading.Lock()
     completed: dict[int, Path] = {}
     local_progress: dict[int, int] = {}
     failures: list[str] = []
-    remaining: deque[OcrChunk] = deque()
+    remaining: list[OcrChunk] = []
+    prepared_pages = 0
+    prepared_chunks = 0
+    active_workers = 0
+    worker_count = min(len(clients), len(chunks))
+    ready: Queue[OcrChunk] = Queue(maxsize=max(2, worker_count * 2))
+    producer_done = threading.Event()
+    client_queues = [Queue(maxsize=2) for _ in range(worker_count)] if worker_count == len(chunks) else [ready] * worker_count
 
     def output_path(chunk: OcrChunk) -> Path:
         return job_dir / f"chunk_{chunk.index:04d}_ocr.pdf"
 
-    for chunk in chunks:
-        target = output_path(chunk)
-        entry = entries.get(str(chunk.index), {})
+    def valid_checkpoint(path: Path, entry: object, chunk: OcrChunk) -> bool:
         try:
-            valid = (isinstance(entry, dict) and entry.get("pages") == chunk.page_count
-                     and target.is_file() and _sha256(target) == entry.get("sha256")
-                     and len(PdfReader(target).pages) == chunk.page_count)
+            return (isinstance(entry, dict) and entry.get("pages") == chunk.page_count
+                    and path.is_file() and _sha256(path) == entry.get("sha256")
+                    and len(PdfReader(path).pages) == chunk.page_count)
         except Exception:
-            valid = False
-        if valid:
+            return False
+
+    for chunk in chunks:
+        _check_cancelled(cancel)
+        target = output_path(chunk)
+        if valid_checkpoint(target, entries.get(str(chunk.index)), chunk):
             completed[chunk.index] = target
             local_progress[chunk.index] = chunk.page_count
+            prepared_pages += chunk.page_count
+            prepared_chunks += 1
         else:
             entries.pop(str(chunk.index), None)
             remaining.append(chunk)
 
+    def save_checkpoint() -> None:
+        # Both the producer and engine threads call this while holding lock.
+        _save_json(manifest_path, {"signature": signature, "completed": entries, "inputs": inputs})
+
     def report(status: str = "running", message: str | None = None) -> None:
-        # Called under the same lock that protects page counts, so UI updates stay ordered.
         if on_progress is not None:
-            on_progress(OcrProgress(key, status, sum(local_progress.values()), len(source.pages),
+            on_progress(OcrProgress(key, status, sum(local_progress.values()), total_pages,
                                     status == "success", message,
-                                    completed_chunks=len(completed), total_chunks=len(chunks)))
+                                    completed_chunks=len(completed), total_chunks=len(chunks),
+                                    prepared_pages=prepared_pages, prepared_chunks=prepared_chunks,
+                                    total_workers=worker_count, active_workers=active_workers))
 
-    report("splitting", f"均匀分为 {len(chunks)} 份，已复用 {len(completed)} 份已完成结果。")
-    # PdfReader streams are not thread safe. Build inputs on this one thread.
-    for chunk in remaining:
-        _check_cancelled(cancel_event)
-        writer = PdfWriter()
-        for index in range(chunk.start_page - 1, chunk.end_page):
-            writer.add_page(source.pages[index])
-        writer.write(job_dir / f"chunk_{chunk.index:04d}_input.pdf")
-    _save_json(manifest_path, {"signature": signature, "completed": entries})
+    with lock:
+        report("splitting", f"共 {len(chunks)} 份，使用 {worker_count} 个独立 OCR 实例；"
+                           f"已复用 {len(completed)} 份识别结果。")
+        save_checkpoint()
 
-    def process_queue(client: UmiOcrClient) -> None:
+    def process_queue(client: UmiOcrClient, input_queue: Queue) -> None:
+        nonlocal active_workers
         while True:
-            with lock:
-                if not remaining or (cancel_event is not None and cancel_event.is_set()):
+            if cancel.is_set():
+                return
+            try:
+                chunk = input_queue.get(timeout=0.1)
+            except Empty:
+                if producer_done.is_set():
                     return
-                chunk = remaining.popleft()
+                continue
+            if cancel.is_set():
+                return
+            with lock:
+                active_workers += 1
                 local_progress[chunk.index] = 0
+                report()
             input_path = job_dir / f"chunk_{chunk.index:04d}_input.pdf"
             staging = job_dir / f"chunk_{chunk.index:04d}_{uuid.uuid4().hex}.incoming.pdf"
             def update(progress: OcrProgress) -> None:
@@ -222,8 +247,8 @@ def ocr_pdf_in_chunks(
                     report(message=f"原 PDF 第 {chunk.start_page}–{chunk.end_page} 页正在识别。")
             try:
                 client.ocr_pdf(input_path, staging, extraction_mode=extraction_mode,
-                               on_progress=update, cancel_event=cancel_event)
-                _check_cancelled(cancel_event)
+                               on_progress=update, cancel_event=cancel)
+                _check_cancelled(cancel)
                 if len(PdfReader(staging).pages) != chunk.page_count:
                     raise UmiOcrError(f"第 {chunk.index} 份 OCR 结果页数不一致。")
                 staging.replace(output_path(chunk))
@@ -233,25 +258,81 @@ def ocr_pdf_in_chunks(
                     local_progress[chunk.index] = chunk.page_count
                     entries[str(chunk.index)] = {"pages": chunk.page_count, "sha256": digest,
                                                 "start": chunk.start_page, "end": chunk.end_page}
-                    _save_json(manifest_path, {"signature": signature, "completed": entries})
+                    inputs.pop(str(chunk.index), None)
+                    save_checkpoint()
                     report()
                 input_path.unlink(missing_ok=True)
             except OcrCancelledError:
-                if cancel_event is not None:
-                    cancel_event.set()
+                cancel.set()
                 return
             except Exception as exc:
                 with lock:
                     failures.append(f"第 {chunk.index} 份（{chunk.start_page}–{chunk.end_page} 页）：{exc}")
                     report()
             finally:
+                with lock:
+                    active_workers -= 1
+                    report()
                 staging.unlink(missing_ok=True)
 
-    with ThreadPoolExecutor(max_workers=min(len(clients), len(chunks))) as executor:
-        futures = [executor.submit(process_queue, client) for client in clients[:len(chunks)]]
+    def prepare_inputs() -> None:
+        nonlocal prepared_pages, prepared_chunks
+        # Source reader and its recovery index belong to this thread only.
+        for chunk in remaining:
+            _check_cancelled(cancel)
+            input_path = job_dir / f"chunk_{chunk.index:04d}_input.pdf"
+            if valid_checkpoint(input_path, inputs.get(str(chunk.index)), chunk):
+                with lock:
+                    prepared_pages += chunk.page_count
+                    prepared_chunks += 1
+                    report("splitting", f"复用第 {chunk.index}/{len(chunks)} 份已验证输入。")
+            else:
+                staging = job_dir / f".{chunk.index:04d}.{uuid.uuid4().hex}.input.pdf"
+                try:
+                    writer = PdfWriter()
+                    for index in range(chunk.start_page - 1, chunk.end_page):
+                        _check_cancelled(cancel)
+                        writer.add_page(source.pages[index])
+                        with lock:
+                            prepared_pages += 1
+                            report("splitting", f"准备第 {chunk.index}/{len(chunks)} 份输入："
+                                               f"第 {index + 1}/{total_pages} 页。")
+                    _check_cancelled(cancel)
+                    writer.write(staging)
+                    if len(PdfReader(staging).pages) != chunk.page_count:
+                        raise UmiOcrError(f"第 {chunk.index} 份输入页数校验失败。")
+                    _check_cancelled(cancel)
+                    staging.replace(input_path)
+                    digest = _sha256(input_path)
+                    with lock:
+                        inputs[str(chunk.index)] = {"pages": chunk.page_count, "sha256": digest}
+                        prepared_chunks += 1
+                        save_checkpoint()
+                        warning = f"；跳过 {len(source.missing_objects)} 个缺失对象引用" if source.missing_objects else ""
+                        report("splitting", f"第 {chunk.index}/{len(chunks)} 份输入就绪{warning}。")
+                finally:
+                    staging.unlink(missing_ok=True)
+            while True:
+                _check_cancelled(cancel)
+                try:
+                    client_queues[(chunk.index - 1) % worker_count].put(chunk, timeout=0.1)
+                    break
+                except Full:
+                    continue
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(process_queue, client, client_queues[index])
+                   for index, client in enumerate(clients[:worker_count])]
+        try:
+            prepare_inputs()
+        except BaseException:
+            cancel.set()
+            raise
+        finally:
+            producer_done.set()
         for future in futures:
             future.result()
-    _check_cancelled(cancel_event)
+    _check_cancelled(cancel)
     if failures or len(completed) != len(chunks):
         raise ChunkOcrError(f"分块 OCR 未完成，已保留 {len(completed)}/{len(chunks)} 份结果；"
                             f"重试可继续。{'；'.join(failures)}\n断点目录：{job_dir}",
@@ -264,19 +345,23 @@ def ocr_pdf_in_chunks(
     try:
         writer = PdfWriter()
         for chunk in chunks:
-            _check_cancelled(cancel_event)
-            result = PdfReader(completed[chunk.index])
+            _check_cancelled(cancel)
+            result = RecoveryPdfReader(completed[chunk.index])
             if len(result.pages) != chunk.page_count:
                 raise UmiOcrError("合并前发现分块页数不一致，请重试该任务。")
             for page in result.pages:
+                _check_cancelled(cancel)
                 writer.add_page(page)
         if source.metadata:
             writer.add_metadata({str(k): str(v) for k, v in source.metadata.items() if v is not None})
         _copy_outline(source, writer)
+        _check_cancelled(cancel)
         writer.write(staging)
-        if len(PdfReader(staging).pages) != len(source.pages):
+        if len(PdfReader(staging).pages) != total_pages:
             raise UmiOcrError("合并后的 OCR PDF 页数与原文件不一致。")
-        _check_cancelled(cancel_event)
+        _check_cancelled(cancel)
+        if _sha256(source_path) != signature["source_sha256"]:
+            raise ChunkOcrError("原 PDF 在合并期间发生变化，未发布输出。", job_dir, len(completed))
         staging.replace(destination_path)
     finally:
         staging.unlink(missing_ok=True)

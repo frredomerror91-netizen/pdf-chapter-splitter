@@ -15,12 +15,17 @@ from typing import Callable
 from umi_ocr_client import DEFAULT_UMI_OCR_URL, OcrCancelledError, UmiOcrClient, UmiOcrError, validate_local_url
 
 
+DEFAULT_OCR_WORKERS = 4
+MAX_THREADS_PER_WORKER = 2
+
+
 @dataclass(frozen=True)
 class OcrSettings:
     executable: str = ""
     base_url: str = DEFAULT_UMI_OCR_URL
     auto_ocr: bool = True
     dark_mode: bool = False
+    max_workers: int = DEFAULT_OCR_WORKERS
 
 
 class UmiExecutableNotFoundError(UmiOcrError):
@@ -38,13 +43,18 @@ def load_settings(path: Path) -> OcrSettings:
         dark_mode = data.get("dark_mode", False)
         if not isinstance(executable, str) or not isinstance(auto_ocr, bool) or not isinstance(dark_mode, bool):
             return OcrSettings()
-        return OcrSettings(executable, base_url, auto_ocr, dark_mode)
+        max_workers = data.get('max_workers', DEFAULT_OCR_WORKERS)
+        if type(max_workers) is not int or not 0 <= max_workers <= 12:
+            max_workers = DEFAULT_OCR_WORKERS
+        return OcrSettings(executable, base_url, auto_ocr, dark_mode, max_workers)
     except (OSError, ValueError, TypeError, AttributeError, UmiOcrError):
         return OcrSettings()
 
 
 def save_settings(path: Path, settings: OcrSettings) -> None:
     validate_local_url(settings.base_url)
+    if type(settings.max_workers) is not int or not 0 <= settings.max_workers <= 12:
+        raise UmiOcrError('OCR 并发上限须为 0 到 12 的整数。')
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     try:

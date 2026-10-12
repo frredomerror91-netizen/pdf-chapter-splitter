@@ -65,6 +65,10 @@ class OcrProgress:
     message: str | None = None
     completed_chunks: int = 0
     total_chunks: int = 0
+    prepared_pages: int = 0
+    prepared_chunks: int = 0
+    total_workers: int = 0
+    active_workers: int = 0
 
 
 ProgressCallback = Callable[[OcrProgress], None]

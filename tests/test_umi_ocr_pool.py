@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from umi_ocr_pool import prepare_worker_runtime, scoped_stop_worker
+from umi_ocr_pool import UmiOcrPool, prepare_worker_runtime, scoped_stop_worker
 
 
 class WorkerIsolationTests(unittest.TestCase):
@@ -51,3 +51,35 @@ class WorkerIsolationTests(unittest.TestCase):
         ) as terminate:
             scoped_stop_worker(123, self.executable)
         terminate.assert_not_called()
+
+    def test_an_engine_that_exits_during_startup_is_retried_once(self) -> None:
+        first = Mock(pid=101)
+        first.poll.return_value = 1
+        second = Mock(pid=102)
+        second.poll.return_value = None
+        client = Mock()
+        client.is_available.side_effect = [False, True]
+        statuses = []
+        with patch('umi_ocr_pool.subprocess.Popen', side_effect=[first, second]) as launch, patch(
+            'umi_ocr_pool.UmiOcrClient', return_value=client
+        ), patch('umi_ocr_pool.process_executable_path', return_value=None), patch(
+            'umi_ocr_pool.scoped_stop_worker', return_value=True
+        ), patch('umi_ocr_pool.time.sleep'), patch('umi_ocr_pool.time.monotonic', side_effect=[0, 1, 2, 3]):
+            with UmiOcrPool(self.executable, self.root, workers=1, on_status=statuses.append) as pool:
+                self.assertEqual(len(pool.clients), 1)
+        self.assertEqual(launch.call_count, 2)
+        self.assertTrue(any('重试' in message for message in statuses))
+
+    def test_repeated_startup_exit_fails_without_infinite_relaunches(self) -> None:
+        exited = Mock(pid=101)
+        exited.poll.return_value = 1
+        client = Mock()
+        client.is_available.return_value = False
+        with patch('umi_ocr_pool.subprocess.Popen', return_value=exited) as launch, patch(
+            'umi_ocr_pool.UmiOcrClient', return_value=client
+        ), patch('umi_ocr_pool.process_executable_path', return_value=None), patch(
+            'umi_ocr_pool.time.sleep'
+        ), patch('umi_ocr_pool.time.monotonic', side_effect=[0, 1, 61, 62]), self.assertRaisesRegex(Exception, '启动失败'):
+            with UmiOcrPool(self.executable, self.root, workers=1):
+                pass
+        self.assertEqual(launch.call_count, 2)

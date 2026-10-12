@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfWriter
+from pdf_reader_recovery import RecoveryPdfReader as PdfReader
 
 
 @dataclass(frozen=True)

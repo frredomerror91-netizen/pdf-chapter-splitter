@@ -44,7 +44,7 @@ CONTROL_DISABLED_BG = "#F1F4F8"
 ACCENT_DISABLED_BG = "#AFC4ED"
 PROGRESS_TRACK = "#E6EDF5"
 RADIO_ACTIVE_BG = "#F4F7FF"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 THEME_LIGHT = {
     "app_bg": "#F3F6FA", "card_bg": "#FFFFFF", "ink": "#172033", "muted": "#65758B",
@@ -582,6 +582,12 @@ class PdfChapterSplitterApp:
         ttk.Label(frame, text="本地服务地址", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(18, 0))
         url_var = tk.StringVar(value=self.ocr_settings.base_url)
         ttk.Entry(frame, textvariable=url_var).pack(fill="x", pady=(8, 12))
+        ttk.Label(frame, text="OCR 并发上限", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(8, 0))
+        workers_var = tk.StringVar(value=str(self.ocr_settings.max_workers))
+        ttk.Spinbox(frame, from_=0, to=12, textvariable=workers_var, width=8).pack(anchor="w", pady=(8, 6))
+        ttk.Label(frame, text="默认 4；0 = 自动；1–12 = 实例数量上限。按分块数、CPU 和可用内存选择。\n"
+                             "资源足够时每个分块使用一个实例，资源不足时其余分块排队。",
+                  style="Muted.TLabel", wraplength=440, justify="left").pack(anchor="w", pady=(0, 12))
         ttk.Label(
             frame,
             text="首次使用：下载并解压 Umi-OCR v2.1.4 或更高版本。\n"
@@ -598,7 +604,13 @@ class PdfChapterSplitterApp:
                 executable = Path(path_value).resolve() if path_value else None
                 if executable is not None and (not executable.is_file() or executable.name.lower() != "umi-ocr.exe"):
                     raise UmiOcrError("请选择有效的 Umi-OCR.exe 文件。")
-                settings = replace(self.ocr_settings, executable=str(executable) if executable else "",
+                try:
+                    max_workers = int(workers_var.get().strip())
+                except ValueError as exc:
+                    raise UmiOcrError("并发上限请输入 0 到 12 的整数。") from exc
+                if not 0 <= max_workers <= 12:
+                    raise UmiOcrError("并发上限请输入 0 到 12 的整数。")
+                settings = replace(self.ocr_settings, max_workers=max_workers, executable=str(executable) if executable else "",
                                    base_url=base_url, auto_ocr=self.auto_ocr_var.get())
                 save_settings(self._settings_path, settings)
             except (OSError, UmiOcrError) as exc:
@@ -657,7 +669,7 @@ class PdfChapterSplitterApp:
                     prepare_service=prepare_service,
                     on_progress=lambda progress: self._events.put(("ocr_progress", progress)),
                     cancel_event=self._cancel_event,
-                    workspace_dir=self.project_dir, executable=executable,
+                    workspace_dir=self.project_dir, executable=executable, max_workers=settings.max_workers,
                 )
                 self._events.put(("analysis_finished", result))
             except Exception as exc:
@@ -747,18 +759,45 @@ class PdfChapterSplitterApp:
 
     def _show_ocr_progress(self, progress: OcrProgress) -> None:
         if progress.total_pages:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", maximum=progress.total_pages, value=progress.processed_pages)
-        if progress.status in {"preparing", "splitting", "merging"}:
-            self.method_var.set("准备分块 OCR" if progress.status != "merging" else "合并 OCR 结果")
+            self.page_count_var.set(str(progress.total_pages))
+            if progress.status == "preparing":
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            else:
+                self.progress.stop()
+                maximum = progress.total_pages
+                value = progress.processed_pages
+                if progress.total_workers:
+                    maximum *= 2
+                    value += progress.prepared_pages
+                self.progress.configure(mode="determinate", maximum=maximum, value=value)
+        if progress.status == "preparing":
+            self.method_var.set("启动 OCR 实例")
+            self._set_status(progress.message or "正在启动独立 OCR 实例……")
+            return
+        if progress.status == "merging":
+            self.method_var.set("合并 OCR 结果")
+            self._set_status(progress.message or "正在按原页序合并 OCR 结果……")
+            return
+        if progress.total_workers:
+            self.method_var.set("准备 / OCR 并行" if progress.prepared_pages < progress.total_pages
+                                else "分块 OCR 处理中")
+            details = (f"输入准备 {progress.prepared_pages}/{progress.total_pages} 页；"
+                       f"OCR {progress.processed_pages}/{progress.total_pages} 页；"
+                       f"完成 {progress.completed_chunks}/{progress.total_chunks} 份；"
+                       f"运行 {progress.active_workers}/{progress.total_workers} 实例。")
+            if progress.status == "splitting" and progress.message:
+                details += " " + progress.message
+            self._set_status(details)
+            return
+        if progress.status == "splitting":
+            self.method_var.set("准备分块 OCR")
             self._set_status(progress.message or "正在处理 OCR 分块……")
             return
         if progress.total_chunks > 1:
             self.method_var.set("分块 OCR 处理中")
-            self._set_status(
-                f"分块 OCR：已完成 {progress.completed_chunks}/{progress.total_chunks} 份，"
-                f"进度 {progress.processed_pages}/{progress.total_pages} 页。"
-            )
+            self._set_status(f"分块 OCR：已完成 {progress.completed_chunks}/{progress.total_chunks} 份，"
+                             f"进度 {progress.processed_pages}/{progress.total_pages} 页。")
             return
         self.method_var.set("OCR 处理中")
         if progress.status == "waiting":

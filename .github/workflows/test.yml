@@ -28,4 +28,4 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py"
 
       - name: Compile application modules
-        run: python -m py_compile pdf_chapter_splitter_core.py pdf_ocr_workflow.py ocr_chunks.py umi_ocr_pool.py umi_ocr_client.py umi_ocr_service.py split_pdf_by_chapter.py
+        run: python -m py_compile pdf_chapter_splitter_core.py pdf_ocr_workflow.py pdf_reader_recovery.py ocr_chunks.py umi_ocr_pool.py umi_ocr_client.py umi_ocr_service.py split_pdf_by_chapter.py

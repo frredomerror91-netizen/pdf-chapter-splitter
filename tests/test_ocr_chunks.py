@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
@@ -86,7 +87,7 @@ class ChunkPlanTests(unittest.TestCase):
 
 class ChunkOcrTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(__file__).parent / "_fixtures" / self._testMethodName
+        self.root = Path(__file__).parent / "_fixtures" / ("chunks_" + hashlib.sha256(self._testMethodName.encode()).hexdigest()[:12])
         self.root.mkdir(parents=True, exist_ok=True)
         self.source = self.root / "book.pdf"
         self.target = self.root / "book_OCR.pdf"
@@ -211,3 +212,85 @@ class ChunkOcrTests(unittest.TestCase):
         with self.assertRaisesRegex(ChunkOcrError, "发生变化"):
             self.run_ocr()
         self.assertFalse(self.target.exists())
+
+    def test_preparation_reports_every_page_and_can_cancel_before_ocr(self) -> None:
+        cancel = threading.Event()
+        progress: list[OcrProgress] = []
+        def report(value: OcrProgress) -> None:
+            progress.append(value)
+            if getattr(value, 'prepared_pages', 0) == 2:
+                cancel.set()
+        with self.assertRaises(OcrCancelledError):
+            self.run_ocr(on_progress=report, cancel_event=cancel)
+        self.assertEqual(max(p.prepared_pages for p in progress), 2)
+        self.assertEqual(self.tracker.calls, [])
+        self.assertFalse(self.target.exists())
+
+    def test_first_chunk_starts_recognition_before_last_chunk_is_prepared(self) -> None:
+        entered = threading.Event()
+        original_client = self.clients[0].ocr_pdf
+        original_add = PdfWriter.add_page
+        def client(source: Path, target: Path, **kwargs: object) -> Path:
+            entered.set()
+            return original_client(source, target, **kwargs)
+        for item in self.clients:
+            item.ocr_pdf = client
+        def add_page(writer: PdfWriter, page, *args, **kwargs):
+            text = page.extract_text().strip()
+            if threading.current_thread() is threading.main_thread() and text == 'Original page 4':
+                self.assertTrue(entered.wait(1), 'OCR must start while later inputs are still preparing')
+            return original_add(writer, page, *args, **kwargs)
+        with patch.object(PdfWriter, 'add_page', add_page):
+            self.run_ocr()
+        self.assertEqual(len(PdfReader(self.target).pages), 7)
+
+    def test_resume_reuses_verified_input_after_engine_failure(self) -> None:
+        self.tracker.failures.add(4)
+        with self.assertRaises(ChunkOcrError):
+            self.run_ocr()
+        source_inputs = sorted(self.cache.glob('*/chunk_*_input.pdf'))
+        saved_times = {item.name: item.stat().st_mtime_ns for item in source_inputs}
+        self.tracker.failures.clear()
+        observed = {}
+        original = self.clients[0].ocr_pdf
+        def record(source: Path, target: Path, **kwargs: object) -> Path:
+            observed[source.name] = source.stat().st_mtime_ns
+            return original(source, target, **kwargs)
+        for item in self.clients:
+            item.ocr_pdf = record
+        self.run_ocr()
+        self.assertTrue(observed)
+        self.assertEqual(observed, {name: saved_times[name] for name in observed})
+
+    def test_recovery_with_corrupt_input_rebuilds_it_instead_of_uploading_it(self) -> None:
+        self.tracker.failures.add(4)
+        with self.assertRaises(ChunkOcrError):
+            self.run_ocr()
+        failed_input = next(self.cache.glob('*/chunk_0002_input.pdf'))
+        failed_input.write_bytes(b'broken input')
+        self.tracker.failures.clear()
+        original = self.clients[0].ocr_pdf
+        rebuilt_pages = []
+        def record(source: Path, target: Path, **kwargs: object) -> Path:
+            if source.name == 'chunk_0002_input.pdf':
+                rebuilt_pages.append(len(PdfReader(source).pages))
+            return original(source, target, **kwargs)
+        for item in self.clients:
+            item.ocr_pdf = record
+        self.run_ocr()
+        self.assertEqual(rebuilt_pages, [2])
+        self.assertEqual(len(PdfReader(self.target).pages), 7)
+
+    def test_each_chunk_gets_its_own_engine_when_enough_clients_are_available(self) -> None:
+        assignments = [[] for _ in range(7)]
+        clients = []
+        for index in range(7):
+            client = TestOcrClient(self.tracker)
+            original = client.ocr_pdf
+            def assigned(source: Path, target: Path, _index=index, _call=original, **kwargs: object) -> Path:
+                assignments[_index].append(source.name)
+                return _call(source, target, **kwargs)
+            client.ocr_pdf = assigned
+            clients.append(client)
+        ocr_pdf_in_chunks(self.source, self.target, clients, cache_dir=self.cache, max_chunk_pages=1)
+        self.assertEqual(assignments, [[f'chunk_{number:04d}_input.pdf'] for number in range(1, 8)])

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import shutil
 import threading
 import unittest
@@ -116,3 +118,24 @@ class UmiOcrServiceTests(unittest.TestCase):
         ), patch("umi_ocr_service.subprocess.run") as stop, patch("umi_ocr_service.subprocess.Popen"):
             ensure_umi_service(client, executable)
         stop.assert_not_called()
+
+    def test_old_settings_load_with_four_worker_limit(self) -> None:
+        config = self.root / 'umi-ocr.local.json'
+        config.write_text('{"auto_ocr":false}', encoding='utf-8')
+        settings = load_settings(config)
+        self.assertEqual(settings.max_workers, 4)
+        self.assertFalse(settings.auto_ocr)
+
+    def test_manual_worker_limit_round_trips_and_bad_values_fall_back(self) -> None:
+        config = self.root / 'umi-ocr.local.json'
+        settings = OcrSettings(max_workers=7)
+        save_settings(config, settings)
+        self.assertEqual(load_settings(config), settings)
+        for value in (-1, 13, True, '7'):
+            config.write_text(json.dumps({'max_workers': value}), encoding='utf-8')
+            self.assertEqual(load_settings(config).max_workers, 4)
+
+    def test_explicit_automatic_mode_remains_available_after_default_changes(self) -> None:
+        config = self.root / 'umi-ocr.local.json'
+        save_settings(config, OcrSettings(max_workers=0))
+        self.assertEqual(load_settings(config).max_workers, 0)

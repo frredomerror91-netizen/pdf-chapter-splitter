@@ -12,10 +12,64 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable
 
 from umi_ocr_client import OcrCancelledError, UmiOcrClient, UmiOcrError
-from umi_ocr_service import process_executable_path
+from umi_ocr_service import DEFAULT_OCR_WORKERS, MAX_THREADS_PER_WORKER, process_executable_path
+
+
+
+MAX_OCR_WORKERS = 12
+WORKER_MEMORY_MB = 768
+MEMORY_RESERVE_MB = 1024
+
+
+@dataclass(frozen=True)
+class OcrWorkerPlan:
+    chunk_count: int
+    worker_count: int
+    threads_per_worker: int
+    cpu_limit: int
+    memory_limit: int
+
+
+def get_available_memory_mb() -> int | None:
+    if sys.platform != 'win32':
+        try:
+            return int(os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') // (1024 * 1024))
+        except (OSError, ValueError, AttributeError):
+            return None
+    import ctypes
+    from ctypes import wintypes
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', wintypes.DWORD), ('load', wintypes.DWORD),
+                    ('total_phys', ctypes.c_ulonglong), ('avail_phys', ctypes.c_ulonglong),
+                    ('total_page', ctypes.c_ulonglong), ('avail_page', ctypes.c_ulonglong),
+                    ('total_virtual', ctypes.c_ulonglong), ('avail_virtual', ctypes.c_ulonglong),
+                    ('avail_extended', ctypes.c_ulonglong)]
+    state = MemoryStatus()
+    state.length = ctypes.sizeof(state)
+    try:
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
+            return int(state.avail_phys // (1024 * 1024))
+    except (OSError, AttributeError):
+        pass
+    return None
+
+
+def plan_ocr_workers(total_pages: int, *, max_workers: int = DEFAULT_OCR_WORKERS, cpu_count: int | None = None,
+                     available_memory_mb: int | None = None, max_chunk_pages: int = 50) -> OcrWorkerPlan:
+    if (total_pages < 1 or max_chunk_pages < 1 or type(max_workers) is not int
+        or not 0 <= max_workers <= MAX_OCR_WORKERS):
+        raise ValueError('页数必须大于 0，并发上限须为 0 到 12 的整数。')
+    cpus = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 2))
+    memory = available_memory_mb if available_memory_mb is not None else get_available_memory_mb()
+    chunks = (total_pages + max_chunk_pages - 1) // max_chunk_pages
+    cpu_limit = max(1, cpus // 2)
+    memory_limit = max(1, (memory - MEMORY_RESERVE_MB) // WORKER_MEMORY_MB) if memory is not None else 2
+    workers = max(1, min(chunks, cpu_limit, memory_limit, max_workers or MAX_OCR_WORKERS))
+    return OcrWorkerPlan(chunks, workers, max(1, min(MAX_THREADS_PER_WORKER, cpus // workers)), cpu_limit, memory_limit)
 
 
 _MUTABLE_NAMES = {".settings", ".pre_settings", "temp_doc", "logs", "__pycache__"}
@@ -81,13 +135,15 @@ def _free_local_port() -> int:
 
 
 class UmiOcrPool:
-    """Two hidden, independently configured OCR instances owned by one job."""
-    def __init__(self, executable: Path, workspace: Path, *, workers: int = 2,
+    """Hidden, independently configured OCR instances owned by one job."""
+    def __init__(self, executable: Path, workspace: Path, *, workers: int = DEFAULT_OCR_WORKERS,
                  cancel_event: threading.Event | None = None,
                  on_status: Callable[[str], None] | None = None) -> None:
         self.executable = executable.resolve()
         self.workspace = workspace.resolve()
-        self.worker_count = max(1, min(workers, 2, (os.cpu_count() or 2)))
+        if type(workers) is not int or not 1 <= workers <= MAX_OCR_WORKERS:
+            raise ValueError('OCR 实例数须为 1 到 12 的整数。')
+        self.worker_count = max(1, min(workers, os.cpu_count() or 2))
         self.cancel = cancel_event
         self.on_status = on_status
         self.run_dir = self.workspace / ".ocr-cache" / "engines" / uuid.uuid4().hex
@@ -108,10 +164,30 @@ class UmiOcrPool:
         if self.cancel is not None and self.cancel.is_set():
             raise OcrCancelledError("准备并行 OCR 引擎时已取消。")
 
+    def _launch_engine(self, index: int) -> subprocess.Popen:
+        executable = self.executables[index]
+        return subprocess.Popen([str(executable), "--force"], cwd=str(executable.parent),
+            stdin=subprocess.DEVNULL, stdout=self.logs[index], stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+
+    def _retry_engine(self, index: int) -> None:
+        executable = self.executables[index]
+        launcher = self.launchers[index]
+        if launcher.poll() is None:
+            if not scoped_stop_worker(launcher.pid, executable):
+                raise UmiOcrError(f"第 {index + 1} 个 OCR 实例无响应，无法确认回收，已停止启动。")
+            try:
+                launcher.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                raise UmiOcrError(f"第 {index + 1} 个 OCR 实例未退出，已停止重试。") from exc
+        if self.on_status:
+            self.on_status(f"第 {index + 1} 个 OCR 实例启动未就绪，正在重试（1/1）……")
+        self.launchers[index] = self._launch_engine(index)
+
     def __enter__(self) -> "UmiOcrPool":
         self.run_dir.mkdir(parents=True)
         try:
-            threads = max(1, min(6, (os.cpu_count() or 2) // self.worker_count))
+            threads = max(1, min(MAX_THREADS_PER_WORKER, (os.cpu_count() or 2) // self.worker_count))
             for index in range(self.worker_count):
                 self._check_cancelled()
                 port = _free_local_port()
@@ -123,12 +199,14 @@ class UmiOcrPool:
                 self.clients.append(client)
                 log = (executable.parent / "startup.log").open("wb")
                 self.logs.append(log)
-                process = subprocess.Popen([str(executable), "--hide"], cwd=str(executable.parent),
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                # Private PID state is empty; --force starts this process directly.
+                # --hide alone makes Umi start another process and forward the command.
+                process = self._launch_engine(index)
                 self.launchers.append(process)
             deadline = time.monotonic() + 60
             pending = set(range(len(self.clients)))
+            retries = [0] * len(self.clients)
+            last_ready_count = -1
             while pending:
                 self._check_cancelled()
                 for index in list(pending):
@@ -144,10 +222,28 @@ class UmiOcrPool:
                         pass
                     if self.clients[index].is_available(timeout=0.5):
                         pending.remove(index)
+                        continue
+                    exit_code = self.launchers[index].poll()
+                    if exit_code is not None:
+                        if retries[index]:
+                            raise UmiOcrError(f"第 {index + 1} 个 OCR 实例启动失败（退出码 {exit_code}），已用完一次重试；日志：{self.run_dir}")
+                        self._retry_engine(index)
+                        retries[index] += 1
                 if not pending:
                     break
-                if time.monotonic() >= deadline:
-                    raise UmiOcrError(f"独立 OCR 引擎启动失败，未就绪引擎：{sorted(index + 1 for index in pending)}；日志：{self.run_dir}")
+                ready_count = len(self.clients) - len(pending)
+                if self.on_status and ready_count != last_ready_count:
+                    self.on_status(f"独立 OCR 实例已就绪 {ready_count}/{len(self.clients)}……")
+                    last_ready_count = ready_count
+                now = time.monotonic()
+                if now >= deadline:
+                    retryable = [index for index in pending if retries[index] == 0]
+                    if not retryable:
+                        raise UmiOcrError(f"独立 OCR 引擎启动失败，未就绪引擎：{sorted(index + 1 for index in pending)}；日志：{self.run_dir}")
+                    for index in retryable:
+                        self._retry_engine(index)
+                        retries[index] += 1
+                    deadline = now + 60
                 if self.cancel is not None:
                     self.cancel.wait(0.25)
                 else:
@@ -173,17 +269,25 @@ class UmiOcrPool:
                                           headers={"Content-Type": "application/json"}, timeout=2)
             except (OSError, ValueError, KeyError, UmiOcrError):
                 pass
+        deadline = time.monotonic() + 3
         for executable in self.executables:
             state = executable.parent / "UmiOCR-data" / ".pre_settings"
             try:
                 pid = int(json.loads(state.read_text(encoding="utf-8"))["last_pid"])
-                deadline = time.monotonic() + 3
                 while process_executable_path(pid) == executable.resolve() and time.monotonic() < deadline:
                     time.sleep(0.1)
                 if process_executable_path(pid) == executable.resolve():
                     scoped_stop_worker(pid, executable)
             except (OSError, ValueError, KeyError):
                 pass
+        for launcher, executable in zip(self.launchers, self.executables):
+            if launcher.poll() is None:
+                scoped_stop_worker(launcher.pid, executable)
+            try:
+                launcher.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+        self.launchers.clear()
         for log in self.logs:
             log.close()
         self.logs.clear()

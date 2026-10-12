@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +23,7 @@ from tests.test_umi_ocr_client import _FakeUmiOcrServer
 
 class PdfChapterSplitterAppTests(unittest.TestCase):
     def setUp(self) -> None:
+        gc.collect()
         try:
             self.window = tk.Tk()
         except tk.TclError as exc:
@@ -54,6 +56,10 @@ class PdfChapterSplitterAppTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.server_thread.join(timeout=2)
+        # Tk objects must be released by the main test thread, before any OCR thread can trigger GC.
+        self.app = None
+        self.window = None
+        gc.collect()
         self.assertTrue(self.root.resolve().is_relative_to(Path(__file__).resolve().parent))
         shutil.rmtree(self.root)
 
@@ -233,3 +239,37 @@ class PdfChapterSplitterAppTests(unittest.TestCase):
         self.app._show_ocr_progress(OcrProgress("batch", "merging", 657, 657,
                                               message="正在按原页序合并", completed_chunks=14, total_chunks=14))
         self.assertIn("合并", self.app.status_var.get())
+
+    def test_preparation_progress_is_visible_before_ocr_starts(self) -> None:
+        self.app._show_ocr_progress(OcrProgress('batch', 'splitting', 0, 306,
+                                              prepared_pages=17, total_chunks=7, total_workers=7))
+        self.assertEqual(self.app.page_count_var.get(), '306')
+        self.assertIn('17/306', self.app.status_var.get())
+        self.assertIn('0/7', self.app.status_var.get())
+        self.assertEqual(float(self.app.progress['value']), 17)
+
+    def test_running_progress_displays_preparation_and_active_instances(self) -> None:
+        self.app._show_ocr_progress(OcrProgress('batch', 'splitting', 20, 306,
+                                              prepared_pages=100, prepared_chunks=2,
+                                              total_chunks=7, total_workers=7, active_workers=3))
+        self.assertIn('100/306', self.app.status_var.get())
+        self.assertIn('20/306', self.app.status_var.get())
+        self.assertIn('3/7', self.app.status_var.get())
+        self.assertIn('OCR', self.app.method_var.get())
+
+    def test_worker_limit_can_be_saved_from_settings_dialog(self) -> None:
+        self.app.open_ocr_settings()
+        dialog = next(child for child in self.window.winfo_children() if isinstance(child, tk.Toplevel))
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        spinbox = next(widget for widget in descendants(dialog) if isinstance(widget, ttk.Spinbox))
+        spinbox.delete(0, 'end')
+        spinbox.insert(0, '7')
+        save = next(widget for widget in descendants(dialog)
+                    if isinstance(widget, ttk.Button) and widget.cget('text') == '保存设置')
+        save.invoke()
+        self.assertEqual(self.app.ocr_settings.max_workers, 7)
+        saved = json.loads((self.root / 'umi-ocr.local.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['max_workers'], 7)

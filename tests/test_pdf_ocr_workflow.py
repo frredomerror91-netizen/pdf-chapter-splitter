@@ -23,7 +23,7 @@ class PdfOcrWorkflowTests(unittest.TestCase):
         self.source = self.root / f"{self._testMethodName}_source.pdf"
         self.destination = self.root / f"{self._testMethodName}_ocr.pdf"
         self.outputs = []
-        self.batch_workspace = self.root / (self._testMethodName + "_workspace")
+        self.batch_workspace = self.root / ("work_" + hashlib.sha256(self._testMethodName.encode()).hexdigest()[:12])
         self.batch_workspace.mkdir(exist_ok=True)
 
     def tearDown(self) -> None:
@@ -157,3 +157,22 @@ class PdfOcrWorkflowTests(unittest.TestCase):
             analyze_with_ocr(self.source, self.destination, client, force=True)
         self.assertIsNone(caught.exception.ocr_path)
         self.assertEqual(self.destination.read_bytes(), original)
+
+    def test_large_pdf_uses_resource_plan_and_does_not_require_main_service(self) -> None:
+        self.write_source(pages=120)
+        ready = Mock(side_effect=UmiOcrError('main service must not be required'))
+        class CopyClient:
+            def ocr_pdf(self, source: Path, target: Path, **_kwargs: object) -> Path:
+                target.write_bytes(source.read_bytes())
+                return target
+        pool = Mock(clients=[CopyClient() for _ in range(3)], engine_key='test')
+        with patch('pdf_ocr_workflow.UmiOcrPool') as factory, patch(
+            'umi_ocr_pool.get_available_memory_mb', return_value=16000
+        ), patch('umi_ocr_pool.os.cpu_count', return_value=20):
+            factory.return_value.__enter__.return_value = pool
+            result = analyze_with_ocr(self.source, self.destination, Mock(),
+                                      workspace_dir=self.batch_workspace, executable=self.root / 'Umi-OCR.exe',
+                                      max_workers=7, prepare_service=ready)
+        self.assertTrue(result.used_ocr)
+        self.assertEqual(factory.call_args.kwargs['workers'], 3)
+        ready.assert_not_called()

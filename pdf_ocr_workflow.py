@@ -8,8 +8,8 @@ from typing import Callable
 from pdf_chapter_splitter_core import DetectionResult, analyze_pdf, should_auto_ocr
 from umi_ocr_client import OcrCancelledError, ProgressCallback, UmiOcrClient, UmiOcrError
 from ocr_chunks import CHUNK_THRESHOLD, ocr_pdf_in_chunks
-from umi_ocr_pool import UmiOcrPool
-from umi_ocr_service import find_umi_executable, load_settings
+from umi_ocr_pool import UmiOcrPool, plan_ocr_workers
+from umi_ocr_service import DEFAULT_OCR_WORKERS, find_umi_executable, load_settings, UmiExecutableNotFoundError
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ def analyze_with_ocr(
     cancel_event: threading.Event | None = None,
     workspace_dir: Path | None = None,
     executable: Path | None = None,
+    max_workers: int = DEFAULT_OCR_WORKERS,
 ) -> AnalysisOutcome:
     if cancel_event is not None and cancel_event.is_set():
         raise OcrCancelledError("处理已取消。")
@@ -47,8 +48,6 @@ def analyze_with_ocr(
         return AnalysisOutcome(detection, source_path)
     ocr_finished = False
     try:
-        if prepare_service is not None:
-            prepare_service()
         extraction_mode = "fullPage" if force else "mixed"
         if detection.total_pages >= CHUNK_THRESHOLD:
             workspace = workspace_dir or Path(__file__).resolve().parent
@@ -56,17 +55,23 @@ def analyze_with_ocr(
                 settings = load_settings(workspace / "umi-ocr.local.json")
                 executable = find_umi_executable(workspace, settings.executable)
             if executable is None:
-                raise UmiOcrError("大型 PDF 并行 OCR 需要在“OCR 设置”中选择完整的 Umi-OCR 便携版主程序。")
+                raise UmiExecutableNotFoundError("大型 PDF 并行 OCR 需要在“OCR 设置”中选择完整的 Umi-OCR 便携版主程序。")
+            plan = plan_ocr_workers(detection.total_pages, max_workers=max_workers)
             def engine_status(message: str) -> None:
                 if on_progress is not None:
                     from umi_ocr_client import OcrProgress
-                    on_progress(OcrProgress("pool", "preparing", 0, detection.total_pages, message=message))
-            with UmiOcrPool(executable, workspace, cancel_event=cancel_event, on_status=engine_status) as pool:
+                    on_progress(OcrProgress("pool", "preparing", 0, detection.total_pages, message=message,
+                                             total_chunks=plan.chunk_count, total_workers=plan.worker_count))
+            engine_status(f"{detection.total_pages} 页分为 {plan.chunk_count} 份，使用 {plan.worker_count} 个独立 OCR 实例；"
+                          f"CPU 上限 {plan.cpu_limit}，内存上限 {plan.memory_limit}。")
+            with UmiOcrPool(executable, workspace, workers=plan.worker_count, cancel_event=cancel_event, on_status=engine_status) as pool:
                 ocr_pdf_in_chunks(source_path, destination_path, pool.clients,
                     cache_dir=workspace / ".ocr-cache" / "jobs",
                     extraction_mode=extraction_mode, on_progress=on_progress,
                     cancel_event=cancel_event, engine_key=pool.engine_key)
         else:
+            if prepare_service is not None:
+                prepare_service()
             client.ocr_pdf(source_path, destination_path, extraction_mode=extraction_mode,
                            on_progress=on_progress, cancel_event=cancel_event)
         ocr_finished = True
